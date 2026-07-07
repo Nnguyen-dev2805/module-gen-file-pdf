@@ -1,5 +1,6 @@
 import os
 from typing import Dict, List, Any
+from src.ocr_base import OCRResultSchema
 
 # Standard mock translation lookup
 MOCK_TRANSLATION_MAP: Dict[str, str] = {
@@ -72,3 +73,10 @@ def translate_text(text: str) -> str:
     Falls back to original text if no translation is found in the dictionary.
     """
     return MOCK_TRANSLATION_MAP.get(text, text)
+
+
+class MockOCRProvider:
+    def detect_text(self, image_path: str) -> List[OCRResultSchema]:
+        """Returns mock OCR results, simulating OCR engine."""
+        return detect_text(image_path)
+

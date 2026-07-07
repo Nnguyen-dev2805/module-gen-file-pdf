@@ -94,13 +94,10 @@ def render_example_image_for_pdf(
         except Exception:
             is_mock = True
 
-    # DYNAMIC OCR: Run EasyOCR, or mock adapter in mock/offline mode
-    if is_mock:
-        from src.mock_adapters import detect_text
-        ocr_results = detect_text(source_abs)
-    else:
-        from src.image_translator import detect_text_coordinates_easyocr
-        ocr_results = detect_text_coordinates_easyocr(source_abs)
+    # DYNAMIC OCR: Use dynamic OCRProvider via get_ocr_provider factory
+    from src.ocr_base import get_ocr_provider
+    ocr_provider = get_ocr_provider(mock_mode=is_mock)
+    ocr_results = ocr_provider.detect_text(source_abs)
 
     if not ocr_results:
         print(f"Warning: OCR returned empty results for {source_image_path}. Copying original image.")

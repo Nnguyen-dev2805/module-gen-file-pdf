@@ -4,9 +4,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Dict, Any
-import pytesseract
 
 from src.mock_adapters import detect_text, translate_text, MOCK_OCR_DATA
+from src.ocr_base import OCRResultSchema
 
 
 def create_mock_warehouse_image(output_path: str) -> None:
@@ -81,112 +81,6 @@ def is_primarily_numeric(text: str) -> bool:
     # Remove common formatting symbols
     cleaned = re.sub(r'[\s,\.\-\(\)/+*=%$#@!~?\[\]{}]', '', text)
     return not cleaned or cleaned.isdigit()
-
-
-def detect_text_coordinates_tesseract(image_path: str) -> List[Dict[str, Any]]:
-    """
-    Runs Tesseract OCR on the image at image_path and returns list of detected bounding boxes.
-    Adjacent words on the same horizontal line are merged into single labels using 2D spatial clustering.
-    """
-    try:
-        # Load image with OpenCV for preprocessing
-        cv_img = cv2.imread(image_path)
-        if cv_img is None:
-            raise ValueError(f"Failed to load image for OCR: {image_path}")
-
-        # Convert to grayscale and upscale 2x to detect small and low-contrast diagram text
-        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-
-        data = pytesseract.image_to_data(resized, output_type=pytesseract.Output.DICT)
-        n_boxes = len(data['text'])
-        words = []
-        
-        for i in range(n_boxes):
-            text = data['text'][i].strip()
-            try:
-                conf = float(data['conf'][i])
-            except ValueError:
-                conf = 0.0
-                
-            if not text or conf < 30:
-                continue
-                
-            # Filter noise and non-alphanumeric bridges (dashes, arrows, borders)
-            if not any(char.isalnum() for char in text):
-                continue
-                
-            # Filter out primarily numeric values (numbers are the same anyway)
-            if is_primarily_numeric(text):
-                continue
-                
-            # Map back coordinates (divide by 2.0 to restore original scale)
-            words.append({
-                'text': text,
-                'x': int(data['left'][i] / 2.0),
-                'y': int(data['top'][i] / 2.0),
-                'w': int(data['width'][i] / 2.0),
-                'h': int(data['height'][i] / 2.0)
-            })
-            
-        # 2D Spatial Clustering (ignores Tesseract's noisy column/paragraph logic)
-        # Sort words left-to-right
-        words.sort(key=lambda w: w['x'])
-        
-        clusters = []
-        for word in words:
-            merged = False
-            for cluster in clusters:
-                last = cluster[-1]
-                
-                # Check vertical overlap
-                overlap = min(last['y'] + last['h'], word['y'] + word['h']) - max(last['y'], word['y'])
-                min_h = min(last['h'], word['h'])
-                same_line = overlap >= min_h * 0.45
-                
-                # Also check center-to-center distance as fallback
-                last_y_center = last['y'] + last['h'] / 2.0
-                word_y_center = word['y'] + word['h'] / 2.0
-                same_line_fallback = abs(last_y_center - word_y_center) <= min_h * 0.4
-                
-                if same_line or same_line_fallback:
-                    # Check horizontal distance
-                    dist = word['x'] - (last['x'] + last['w'])
-                    max_dist = max(last['h'], word['h']) * 1.8
-                    max_dist = max(max_dist, 40)  # strict limit to prevent cross-zone merges
-                    
-                    if dist >= -15 and dist <= max_dist:
-                        cluster.append(word)
-                        merged = True
-                        break
-            
-            if not merged:
-                clusters.append([word])
-                
-        # Format and merge labels
-        merged_results = []
-        for cluster in clusters:
-            cluster.sort(key=lambda w: w['x'])
-            merged_text = " ".join([w['text'] for w in cluster])
-            min_x = min([w['x'] for w in cluster])
-            min_y = min([w['y'] for w in cluster])
-            max_r = max([w['x'] + w['w'] for w in cluster])
-            max_b = max([w['y'] + w['h'] for w in cluster])
-            
-            merged_results.append({
-                "text": merged_text,
-                "boundingBox": {
-                    "x": min_x,
-                    "y": min_y,
-                    "width": max_r - min_x,
-                    "height": max_b - min_y
-                }
-            })
-        return merged_results
-    except Exception as e:
-        print(f"Warning: Tesseract OCR failed ({e}). Returning empty list.")
-        return []
-
 
 _EASYOCR_READER = None
 
@@ -264,8 +158,7 @@ def detect_text_coordinates_easyocr(image_path: str) -> List[Dict[str, Any]]:
                 if same_line or same_line_fallback:
                     # Check horizontal distance
                     dist = word['x'] - (last['x'] + last['w'])
-                    max_dist = max(last['h'], word['h']) * 1.8
-                    max_dist = max(max_dist, 40)  # strict limit to prevent cross-zone merges
+                    max_dist = max(last['h'], word['h']) * 2.0  # Dynamic threshold based on text height
                     
                     if dist >= -15 and dist <= max_dist:
                         cluster.append(word)
@@ -294,17 +187,80 @@ def detect_text_coordinates_easyocr(image_path: str) -> List[Dict[str, Any]]:
                     "height": max_b - min_y
                 }
             })
-        return merged_results
+            
+        # 2D Vertical Clustering (merging wrapped multi-line text)
+        merged_results.sort(key=lambda item: item["boundingBox"]["y"])
+        
+        vertical_clusters = []
+        for item in merged_results:
+            bbox = item["boundingBox"]
+            merged_v = False
+            for cluster in vertical_clusters:
+                last_item = cluster[-1]
+                last_bbox = last_item["boundingBox"]
+                
+                # Check vertical proximity (is the current box directly underneath the last box?)
+                gap_y = bbox["y"] - (last_bbox["y"] + last_bbox["height"])
+                max_h = max(last_bbox["height"], bbox["height"])
+                vertically_close = -10 <= gap_y <= (max_h * 1.5)
+                
+                # Check horizontal alignment
+                last_cx = last_bbox["x"] + last_bbox["width"] / 2.0
+                cx = bbox["x"] + bbox["width"] / 2.0
+                max_w = max(last_bbox["width"], bbox["width"])
+                horizontally_aligned = abs(last_cx - cx) <= (max_w * 0.5)
+                
+                # Check horizontal overlap
+                overlap_x = min(last_bbox["x"] + last_bbox["width"], bbox["x"] + bbox["width"]) - max(last_bbox["x"], bbox["x"])
+                min_w = min(last_bbox["width"], bbox["width"])
+                horizontally_overlapping = overlap_x >= (min_w * 0.3)
+                
+                if vertically_close and (horizontally_aligned or horizontally_overlapping):
+                    cluster.append(item)
+                    merged_v = True
+                    break
+            
+            if not merged_v:
+                vertical_clusters.append([item])
+                
+        # Format final 2D merged results
+        final_results = []
+        for cluster in vertical_clusters:
+            cluster.sort(key=lambda item: item["boundingBox"]["y"])
+            merged_text = " ".join([item["text"] for item in cluster])
+            min_x = min([item["boundingBox"]["x"] for item in cluster])
+            min_y = min([item["boundingBox"]["y"] for item in cluster])
+            max_r = max([item["boundingBox"]["x"] + item["boundingBox"]["width"] for item in cluster])
+            max_b = max([item["boundingBox"]["y"] + item["boundingBox"]["height"] for item in cluster])
+            
+            final_results.append({
+                "text": merged_text,
+                "boundingBox": {
+                    "x": min_x,
+                    "y": min_y,
+                    "width": max_r - min_x,
+                    "height": max_b - min_y
+                }
+            })
+            
+        return final_results
     except Exception as e:
         print(f"Warning: EasyOCR failed ({e}). Returning empty list.")
         return []
+
+
+
+class EasyOCRProvider:
+    def detect_text(self, image_path: str) -> List[OCRResultSchema]:
+        """Runs EasyOCR on the image and returns standardized bounding boxes."""
+        return detect_text_coordinates_easyocr(image_path)
 
 
 def translate_image_annotations(image_path: str, output_path: str, client = None) -> None:
     """
     Translates English annotations inside an image to Vietnamese.
     1. Resolves mock image paths to a local deterministic image.
-    2. Runs Tesseract OCR to detect text bounding boxes dynamically.
+    2. Runs OCR (EasyOCR / Mock) to detect text bounding boxes dynamically.
     3. Erases original English text areas using OpenCV (background color matching).
     4. Overlays translated Vietnamese text using Pillow with Roboto font and auto-scaling.
     """
@@ -322,13 +278,13 @@ def translate_image_annotations(image_path: str, output_path: str, client = None
         create_mock_warehouse_image(local_input_path)
 
     # 2. Run OCR to detect text bounding boxes dynamically
-    if client.mock_mode:
-        ocr_results = detect_text(local_input_path)
-    else:
-        ocr_results = detect_text_coordinates_easyocr(local_input_path)
-        if not ocr_results:
-            print("Warning: EasyOCR returned empty results. Falling back to mock OCR data.")
-            ocr_results = detect_text(local_input_path)
+    from src.ocr_base import get_ocr_provider
+    ocr_provider = get_ocr_provider(mock_mode=client.mock_mode)
+    ocr_results = ocr_provider.detect_text(local_input_path)
+    if not client.mock_mode and not ocr_results:
+        print("Warning: EasyOCR returned empty results. Falling back to mock OCR data.")
+        from src.mock_adapters import MockOCRProvider
+        ocr_results = MockOCRProvider().detect_text(local_input_path)
     
     # 2. Load the image into OpenCV for text erasing (inpainting)
     cv_img = cv2.imread(local_input_path)
@@ -337,7 +293,10 @@ def translate_image_annotations(image_path: str, output_path: str, client = None
         
     h, w, c = cv_img.shape
     
-    # Process each bounding box in OpenCV
+    # Create binary mask for inpainting
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # Process each bounding box in OpenCV to build mask
     for item in ocr_results:
         bbox = item["boundingBox"]
         x, y, bw, bh = bbox["x"], bbox["y"], bbox["width"], bbox["height"]
@@ -348,19 +307,17 @@ def translate_image_annotations(image_path: str, output_path: str, client = None
         bw = max(1, min(bw, w - x))
         bh = max(1, min(bh, h - y))
         
-        # Background color matching:
-        # Sample pixels around the border of the bounding box to match the background color
-        # We sample the top-left corner pixel of the box
-        bg_color = cv_img[y, x]  # BGR order
-        
-        # Erase the text by drawing a solid rectangle of the background color
+        # Draw on mask (white fill for pixels to be inpainted)
         cv2.rectangle(
-            cv_img,
+            mask,
             (x, y),
             (x + bw, y + bh),
-            color=(int(bg_color[0]), int(bg_color[1]), int(bg_color[2])),
+            color=255,
             thickness=-1  # Solid fill
         )
+
+    # Perform smart inpainting to restore background naturally
+    cv_img = cv2.inpaint(cv_img, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
 
     # Convert BGR CV2 image back to RGB PIL Image for typography rendering
     pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
